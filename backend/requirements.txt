@@ -1,9 +1,9 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
-# ML stack (Python 3.12 compatible)
+# ML stack – Python 3.12 + Render compatible
 torch==2.5.1
-torchvision==0.20.1
+torchvision==0.21.0
 sentence-transformers==2.6.1
 transformers==4.38.2
 numpy==1.26.4
