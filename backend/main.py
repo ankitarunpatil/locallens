@@ -1,17 +1,14 @@
-
-
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from models.schemas import TourRequest, TourResponse, TourStop
 from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
 
 from models.schemas import (
     SearchRequest, NeighborhoodAnalysisRequest, RecommendationsRequest,
-    TourRequest, PlaceResponse, NeighborhoodAnalysisResponse,
-    RecommendationsResponse, HealthResponse, RecommendationItem, CompareRequest
+    TourRequest, CompareRequest, PlaceResponse, NeighborhoodAnalysisResponse,
+    RecommendationsResponse, HealthResponse, RecommendationItem, TourResponse, TourStop
 )
 from services.embeddings_service import EmbeddingsService
 from services.database_service import DatabaseService
@@ -20,11 +17,11 @@ from services.weather_service import WeatherService
 from services.llm_service import LLMService
 from core.cache import cache
 
+load_dotenv()
+
 # Production configuration
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT == "production"
-
-load_dotenv()
 
 # Global service instances (initialized on startup)
 embeddings: EmbeddingsService = None
@@ -36,7 +33,6 @@ llm_service: LLMService = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    # Startup
     global embeddings, db, places_service, weather_service, llm_service
     
     print("🚀 Starting LocalLens API...")
@@ -51,10 +47,13 @@ async def lifespan(app: FastAPI):
         
         print("=" * 60)
         print("✅ All services initialized successfully!")
+        print(f"🌍 Environment: {ENVIRONMENT}")
         print("💰 Total cost: $0.00/month")
         print("=" * 60)
     except Exception as e:
         print(f"❌ Startup error: {e}")
+        import traceback
+        traceback.print_exc()
         raise
     
     yield
@@ -71,24 +70,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Update CORS for production
+# CORS middleware - single configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",  # Local development
+        "http://localhost:5173",
         "http://localhost:3000",
-        "https://*.vercel.app",   # Vercel deployments
-        os.getenv("FRONTEND_URL", "")  # Production frontend
-    ] if not IS_PRODUCTION else [os.getenv("FRONTEND_URL", "*")],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
+        "https://*.vercel.app",
+        os.getenv("FRONTEND_URL", ""),
+        "*"  # Allow all in development
+    ] if not IS_PRODUCTION else ["*"],  # Production: allow all (update with your domain)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,7 +96,7 @@ async def global_exception_handler(request, exc):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error": "Internal server error",
-            "detail": str(exc) if os.getenv("DEBUG") else "An error occurred"
+            "detail": str(exc) if os.getenv("DEBUG") == "true" else "An error occurred"
         }
     )
 
@@ -117,6 +108,7 @@ async def root():
         "app": "LocalLens API",
         "version": "1.0.0",
         "description": "AI-Powered Neighborhood Discovery",
+        "environment": ENVIRONMENT,
         "cost": "$0.00/month",
         "stack": "100% FREE open source",
         "features": [
@@ -143,7 +135,7 @@ async def health_check():
         "cache": "ok"
     }
     
-    all_ok = all(status == "ok" for status in services_status.values())
+    all_ok = all(s == "ok" for s in services_status.values())
     
     return {
         "status": "healthy" if all_ok else "degraded",
@@ -154,12 +146,7 @@ async def health_check():
 @app.post("/api/search", response_model=list[PlaceResponse], tags=["Search"])
 async def search_places(request: SearchRequest):
     """
-    Search for places using semantic search
-    
-    Combines:
-    - Vector similarity search
-    - Geographic filtering
-    - Real-time OSM data
+    Search for places (production uses keyword search, dev uses embeddings)
     """
     cache_key = f"search:{request.query}:{request.location}:{request.radius_km}"
     
@@ -172,81 +159,62 @@ async def search_places(request: SearchRequest):
     try:
         lat, lon = request.location
         
-        # Create query embedding
-        query_embedding = embeddings.create_embedding(request.query)
-        
-        # Search database first (fast)
-        db_results = await db.search_places_by_vector(
-            query_embedding,
-            threshold=0.25,
-            limit=request.limit * 2  # Get more to account for filtering
+        # Fetch places from OpenStreetMap
+        print(f"🔍 Searching OpenStreetMap for: {request.query}")
+        osm_places = await places_service.search_nearby(
+            lat=lat,
+            lon=lon,
+            radius=int(request.radius_km * 1000)
         )
         
-        # Filter by distance
-        from math import radians, sin, cos, sqrt, atan2
+        if not osm_places:
+            return []
         
-        def haversine(lat1, lon1, lat2, lon2):
-            R = 6371  # Earth radius in km
-            dlat = radians(lat2 - lat1)
-            dlon = radians(lon2 - lon1)
-            a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1-a))
-            return R * c
+        # Simple keyword filtering (works in production without embeddings)
+        query_lower = request.query.lower()
+        query_keywords = query_lower.split()
         
-        nearby_results = [
-            r for r in db_results
-            if haversine(lat, lon, float(r['lat']), float(r['lng'])) <= request.radius_km
-        ]
+        scored_places = []
+        for place in osm_places:
+            score = 0
+            name_lower = place['name'].lower()
+            category_lower = place.get('category', '').lower()
+            cuisine = place.get('tags', {}).get('cuisine', '').lower()
+            
+            # Score based on keyword matches
+            for keyword in query_keywords:
+                if keyword in name_lower:
+                    score += 3
+                if keyword in category_lower:
+                    score += 5
+                if keyword in cuisine:
+                    score += 4
+            
+            if score > 0:
+                scored_places.append((score, place))
         
-        # If we have enough results, use them
-        if len(nearby_results) >= request.limit:
-            results = nearby_results[:request.limit]
-        else:
-            # Fetch fresh data from OSM
-            print(f"🔍 Fetching fresh data from OpenStreetMap...")
-            osm_places = await places_service.search_nearby(
-                lat=lat,
-                lon=lon,
-                radius=int(request.radius_km * 1000)
-            )
-            
-            # Store new places in database
-            for place in osm_places[:50]:  # Limit to avoid overload
-                place_text = f"{place['name']} {place.get('category', '')} {place.get('cuisine', '')}"
-                place_embedding = embeddings.create_embedding(place_text)
-                
-                await db.upsert_place({
-                    'osm_id': place['osm_id'],
-                    'name': place['name'],
-                    'category': place.get('category'),
-                    'lat': place['lat'],
-                    'lng': place['lon'],
-                    'address': place.get('address'),
-                    'tags': place.get('tags', {}),
-                    'embedding': place_embedding
-                })
-            
-            # Re-run vector search
-            db_results = await db.search_places_by_vector(
-                query_embedding,
-                threshold=0.2,
-                limit=request.limit
-            )
-            
-            results = db_results[:request.limit]
+        # If no keyword matches, return all places
+        if not scored_places:
+            scored_places = [(1, p) for p in osm_places]
+        
+        # Sort by score and take top results
+        scored_places.sort(reverse=True, key=lambda x: x[0])
+        results = [p for _, p in scored_places[:request.limit]]
         
         # Convert to response format
         response = [
             PlaceResponse(
-                id=r.get('id'),
+                id=None,
                 osm_id=r['osm_id'],
                 name=r['name'],
                 category=r.get('category'),
                 lat=float(r['lat']),
-                lon=float(r['lng']),
+                lon=float(r['lon']),
                 address=r.get('address'),
+                phone=r.get('phone'),
+                website=r.get('website'),
                 tags=r.get('tags'),
-                similarity=r.get('similarity')
+                similarity=None
             )
             for r in results
         ]
@@ -267,15 +235,7 @@ async def search_places(request: SearchRequest):
 
 @app.post("/api/neighborhood/analyze", response_model=NeighborhoodAnalysisResponse, tags=["Analysis"])
 async def analyze_neighborhood(request: NeighborhoodAnalysisRequest):
-    """
-    AI-powered neighborhood analysis
-    
-    Analyzes:
-    - Dining & entertainment options
-    - Walkability
-    - Character & vibe
-    - Best resident fit
-    """
+    """AI-powered neighborhood analysis"""
     cache_key = f"analysis:{request.name}:{request.city}"
     
     # Check cache
@@ -356,62 +316,55 @@ async def analyze_neighborhood(request: NeighborhoodAnalysisRequest):
 
 @app.post("/api/recommendations", response_model=RecommendationsResponse, tags=["Recommendations"])
 async def get_recommendations(request: RecommendationsRequest):
-    """
-    Get personalized place recommendations
-    
-    Uses AI to match places to user preferences
-    """
+    """Get personalized place recommendations"""
     try:
         lat, lon = request.location
         
-        # Create preference embedding
-        query = " ".join(request.preferences)
-        query_embedding = embeddings.create_embedding(query)
-        
-        # Vector search
-        results = await db.search_places_by_vector(
-            query_embedding,
-            threshold=0.3,
-            limit=request.limit * 2
+        # Get nearby places
+        places = await places_service.search_nearby(
+            lat=lat,
+            lon=lon,
+            radius=int(request.radius_km * 1000)
         )
         
-        # Filter by distance
-        from math import radians, sin, cos, sqrt, atan2
+        if not places:
+            return RecommendationsResponse(recommendations=[], total_found=0)
         
-        def haversine(lat1, lon1, lat2, lon2):
-            R = 6371
-            dlat = radians(lat2 - lat1)
-            dlon = radians(lon2 - lon1)
-            a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1-a))
-            return R * c
+        # Simple keyword filtering by preferences
+        query_lower = " ".join(request.preferences).lower()
+        scored_places = []
         
-        nearby = [
-            r for r in results
-            if haversine(lat, lon, float(r['lat']), float(r['lng'])) <= request.radius_km
-        ][:request.limit * 2]  # Get more for AI to choose from
+        for place in places:
+            score = 0
+            for pref in request.preferences:
+                pref_lower = pref.lower()
+                if pref_lower in place['name'].lower():
+                    score += 2
+                if pref_lower in place.get('category', '').lower():
+                    score += 3
+            if score > 0:
+                scored_places.append((score, place))
         
-        if not nearby:
-            # Return empty response if no places found
-            return RecommendationsResponse(
-                recommendations=[],
-                total_found=0
-            )
+        # Sort and take top matches
+        scored_places.sort(reverse=True, key=lambda x: x[0])
+        top_places = [p for _, p in scored_places[:request.limit * 2]]
+        
+        if not top_places:
+            top_places = places[:request.limit * 2]
         
         # Get AI explanations
         ai_recs = await llm_service.generate_recommendations(
             preferences=request.preferences,
-            places=nearby,
+            places=top_places,
             limit=request.limit
         )
         
         # Build response
         recommendations = []
         for rec in ai_recs.get('recommendations', [])[:request.limit]:
-            # Find matching place for coordinates
             matching_place = next(
-                (p for p in nearby if p['name'].lower() == rec['name'].lower()),
-                nearby[0] if nearby else None  # Fallback to first place
+                (p for p in top_places if p['name'].lower() == rec['name'].lower()),
+                top_places[0] if top_places else None
             )
             
             if matching_place:
@@ -421,13 +374,13 @@ async def get_recommendations(request: RecommendationsRequest):
                         category=matching_place.get('category'),
                         reason=rec['reason'],
                         lat=float(matching_place['lat']),
-                        lon=float(matching_place['lng'])
+                        lon=float(matching_place['lon'])
                     )
                 )
         
         return RecommendationsResponse(
             recommendations=recommendations,
-            total_found=len(nearby)
+            total_found=len(top_places)
         )
         
     except Exception as e:
@@ -439,38 +392,18 @@ async def get_recommendations(request: RecommendationsRequest):
             detail=f"Recommendations failed: {str(e)}"
         )
 
-@app.get("/api/cache/stats", tags=["Admin"])
-async def cache_stats():
-    """Get cache statistics"""
-    return cache.get_stats()
-
-@app.post("/api/cache/clear", tags=["Admin"])
-async def clear_cache():
-    """Clear all cache"""
-    cache.clear()
-    return {"message": "Cache cleared successfully"}
-
-
 @app.post("/api/tours/generate", response_model=TourResponse, tags=["Tours"])
 async def generate_walking_tour(request: TourRequest):
-    """
-    Generate AI-powered walking tour
-    
-    Creates an optimized route based on:
-    - User interests
-    - Walking distance
-    - Place ratings/popularity
-    - Logical geographic flow
-    """
+    """Generate AI-powered walking tour"""
     try:
         lat, lon = request.location
         
-        # Get places within walking distance (1.5km = ~20min walk)
+        # Get places within walking distance
         places = await places_service.search_nearby(
             lat=lat,
             lon=lon,
             radius=1500,
-            amenity_types=None  # Get all types
+            amenity_types=None
         )
         
         if not places:
@@ -499,7 +432,7 @@ async def generate_walking_tour(request: TourRequest):
                     break
         
         if not relevant_places:
-            relevant_places = places[:20]  # Fallback to any places
+            relevant_places = places[:20]
         
         # Use LLM to create tour
         places_text = "\n".join([
@@ -514,13 +447,7 @@ User interests: {', '.join(request.interests)}
 Available places nearby:
 {places_text}
 
-Create an optimal walking route with 4-6 stops. Consider:
-- Walking distance between stops (keep it reasonable)
-- Logical geographic flow (don't zigzag)
-- Variety of experiences
-- Time spent at each location
-
-Return ONLY valid JSON (no markdown):
+Create an optimal walking route with 4-6 stops. Return ONLY valid JSON (no markdown):
 {{
     "title": "Descriptive tour name",
     "total_distance_km": 0.0,
@@ -533,30 +460,29 @@ Return ONLY valid JSON (no markdown):
             "lat": 0.0,
             "lon": 0.0,
             "duration_mins": 30,
-            "why_visit": "brief reason to visit"
+            "why_visit": "brief reason"
         }}
     ]
 }}
 """
         
-        response = await llm_service.generate(prompt, temperature=0.7)
+        response_text = await llm_service.generate(prompt, temperature=0.7)
         
         # Parse JSON
         import json
         import re
         
-        json_match = re.search(r'```json\s*\n(.*?)\n```', response, re.DOTALL)
+        json_match = re.search(r'```json\s*\n(.*?)\n```', response_text, re.DOTALL)
         if json_match:
-            response = json_match.group(1)
+            response_text = json_match.group(1)
         
-        response = response.strip().strip('`').strip()
-        if response.startswith('json'):
-            response = response[4:].strip()
+        response_text = response_text.strip().strip('`').strip()
+        if response_text.startswith('json'):
+            response_text = response_text[4:].strip()
         
         try:
-            tour_data = json.loads(response)
+            tour_data = json.loads(response_text)
             
-            # Validate and convert to response model
             stops = [
                 TourStop(
                     order=stop.get('order', idx + 1),
@@ -579,9 +505,8 @@ Return ONLY valid JSON (no markdown):
             
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             print(f"⚠️ JSON parsing failed: {e}")
-            print(f"Raw response: {response}")
             
-            # Fallback: create simple tour from first N places
+            # Fallback: create simple tour
             stops = [
                 TourStop(
                     order=idx + 1,
@@ -590,13 +515,13 @@ Return ONLY valid JSON (no markdown):
                     lat=place['lat'],
                     lon=place['lon'],
                     duration_mins=30,
-                    why_visit=f"Popular {place.get('category', 'place')} in the area"
+                    why_visit=f"Popular {place.get('category', 'place')}"
                 )
                 for idx, place in enumerate(relevant_places[:5])
             ]
             
             return TourResponse(
-                title=f"{request.duration_hours}-Hour {', '.join(request.interests).title()} Tour",
+                title=f"{request.duration_hours}-Hour Tour",
                 total_distance_km=2.0,
                 total_duration=f"{request.duration_hours}h",
                 stops=stops
@@ -606,19 +531,16 @@ Return ONLY valid JSON (no markdown):
         raise
     except Exception as e:
         print(f"❌ Tour generation error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Tour generation failed: {str(e)}"
         )
 
-
 @app.post("/api/neighborhoods/compare", tags=["Analysis"])
 async def compare_neighborhoods(request: CompareRequest):
-    """
-    Compare multiple neighborhoods
-    
-    Analyzes and compares neighborhoods across various criteria
-    """
+    """Compare multiple neighborhoods"""
     try:
         analyses = []
         
@@ -649,9 +571,7 @@ async def compare_neighborhoods(request: CompareRequest):
             f"{a['neighborhood']}:\n"
             f"- Summary: {a['analysis'].summary}\n"
             f"- Dining: {a['analysis'].dining_score}/10\n"
-            f"- Walkability: {a['analysis'].walkability_score}/10\n"
-            f"- Best for: {a['analysis'].best_for}\n"
-            f"- Total places: {a['analysis'].total_places}"
+            f"- Walkability: {a['analysis'].walkability_score}/10"
             for a in analyses
         ])
         
@@ -659,33 +579,28 @@ async def compare_neighborhoods(request: CompareRequest):
 
 {comparison_text}
 
-Provide a comparison. Return ONLY valid JSON:
+Return ONLY valid JSON:
 {{
-    "summary": "Overall comparison highlighting key differences",
+    "summary": "Overall comparison",
     "best_for_dining": "neighborhood name",
-    "best_for_walkability": "neighborhood name",
-    "best_for_families": {{"name": "neighborhood", "reason": "why"}},
-    "best_for_young_professionals": {{"name": "neighborhood", "reason": "why"}},
-    "best_for_nightlife": {{"name": "neighborhood", "reason": "why"}}
+    "best_for_walkability": "neighborhood name"
 }}
 """
         
-        response = await llm_service.generate(prompt, temperature=0.7)
+        response_text = await llm_service.generate(prompt, temperature=0.7)
         
-        # Parse JSON
         import json
         import re
         
-        json_match = re.search(r'```json\s*\n(.*?)\n```', response, re.DOTALL)
+        json_match = re.search(r'```json\s*\n(.*?)\n```', response_text, re.DOTALL)
         if json_match:
-            response = json_match.group(1)
+            response_text = json_match.group(1)
         
         try:
-            comparison = json.loads(response.strip().strip('`').strip())
+            comparison = json.loads(response_text.strip().strip('`').strip())
             comparison['neighborhoods'] = analyses
             return comparison
         except:
-            # Fallback
             return {
                 'summary': f"Comparison of {len(analyses)} neighborhoods",
                 'best_for_dining': analyses[0]['neighborhood'],
@@ -697,10 +612,23 @@ Provide a comparison. Return ONLY valid JSON:
         raise
     except Exception as e:
         print(f"❌ Comparison error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Comparison failed: {str(e)}"
         )
+
+@app.get("/api/cache/stats", tags=["Admin"])
+async def cache_stats():
+    """Get cache statistics"""
+    return cache.get_stats()
+
+@app.post("/api/cache/clear", tags=["Admin"])
+async def clear_cache():
+    """Clear all cache"""
+    cache.clear()
+    return {"message": "Cache cleared successfully"}
 
 if __name__ == "__main__":
     import uvicorn
@@ -708,5 +636,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True  # Auto-reload on code changes
+        reload=True
     )
